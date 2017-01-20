@@ -5,6 +5,7 @@
 // gcc osmfilter.c -O3 -o osmfilter
 //
 // (c) 2011..2015 Markus Weber, Nuernberg
+// (c) 2017 Stan Tomlinson
 //
 // This program is free software; you can redistribute it and/or
 // modify it under the terms of the GNU Affero General Public License
@@ -39,6 +40,7 @@ const char* shorthelptext=
 "--keep-node-way-tags=\n"
 "--keep-node-relation-tags=\n"
 "--keep-way-relation-tags=\n"
+"--keep-id=ID              keep a particular node/way/relationship\n"
 "--drop-tags=              define which tags are to be dropped\n"
 "--drop-...-tags=          similar to --keep-...-tags= (see above)\n"
 "--drop-author             delete changeset and user information\n"
@@ -98,6 +100,9 @@ const char* helptext=
 "--keep-nodes-relations=OBJECT_FILTER\n"
 "--keep-ways-relations=OBJECT_FILTER\n"
 "        Same as above, but just for the specified object types.\n"
+"\n"
+"--keep-id=ID\n"
+"        keep a particular node/way/relationship (ID is a number)\n"
 "\n"
 "--drop=OBJECT_FILTER\n"
 "        All object types (nodes, ways and relations) which meet the\n"
@@ -472,7 +477,9 @@ static bool global_ignoredependencies= false;
 #define PINFOv(f,...) \
   fprintf(stderr,"osmfilter: " f "\n",__VA_ARGS__);
 #define ONAME(i) \
-  (i==0? "node": i==1? "way": i==2? "relation": "unknown object")
+  ((i)==0? "node": (i)==1? "way": (i)==2? "relation": "unknown object")
+#define ONAMEI(i) \
+  ((i)==3? "id": ONAME(i))
 #define global_fileM 1  // maximum number of input files
 
 //------------------------------------------------------------
@@ -2288,7 +2295,7 @@ static inline bool fil__cmp(const char* s1,const char* s2) {
 
 #define fil__pairM 1000  // maximum number of key-val-pairs
 #define fil__pairkM 100  // maximum length of key or val;
-#define fil__pairtM 12  // maximum number of filter types;
+#define fil__pairtM 13  // maximum number of filter types;
   // these filter types are defined as follows:
   //  0: keep  node     object;
   //  1: keep  way      object;
@@ -2302,6 +2309,7 @@ static inline bool fil__cmp(const char* s1,const char* s2) {
   //  9:  drop node     tag;
   // 10:  drop way      tag;
   // 11:  drop relation tag;
+  // 12: keep  id       number;
 typedef struct {  // key/val pair for the include filter
   char k[fil__pairkM+8];  // key to compare;
     // [0]==0 && [1]==0: same key as previous key in list;
@@ -2317,23 +2325,29 @@ typedef struct {  // key/val pair for the include filter
     // Boolean operator right after the closing bracket, resp.
     // right after the comparison, if there is no closing bracket;
     // false: OR; true: AND;
+  int64_t id;
+    // for ftype 12, if id matches, keep (conversion from k)
   } fil__pair_t;
 static fil__pair_t fil__pair[fil__pairtM][fil__pairM+2]=
-  {{{{0},{0},0,0,false}}};
+  {{{{0},{0},0,0,false,0}}};
 static fil__pair_t* fil__paire[fil__pairtM]=
   { &fil__pair[0][0],&fil__pair[1][0],
     &fil__pair[2][0],&fil__pair[3][0],
     &fil__pair[4][0],&fil__pair[5][0],
     &fil__pair[6][0],&fil__pair[7][0],
     &fil__pair[8][0],&fil__pair[9][0],
-    &fil__pair[10][0],&fil__pair[11][0] };
+    &fil__pair[10][0],&fil__pair[11][0],
+    &fil__pair[12][0]
+    };
 static fil__pair_t* fil__pairee[fil__pairtM]=
   { &fil__pair[0][fil__pairM],&fil__pair[1][fil__pairM],
     &fil__pair[2][fil__pairM],&fil__pair[3][fil__pairM],
     &fil__pair[4][fil__pairM],&fil__pair[5][fil__pairM],
     &fil__pair[6][fil__pairM],&fil__pair[7][fil__pairM],
     &fil__pair[8][fil__pairM],&fil__pair[9][fil__pairM],
-    &fil__pair[10][fil__pairM],&fil__pair[11][fil__pairM] };
+    &fil__pair[10][fil__pairM],&fil__pair[11][fil__pairM],
+    &fil__pair[12][fil__pairM]
+    };
 static int fil__err_tagsbool= 0;
   // number of Boolean expressions in tags filter
 static int fil__err_tagsbracket= 0;
@@ -2403,7 +2417,7 @@ static inline void fil_cpy(char *dest, const char *src,
 
 static bool fil_active[fil__pairtM]=
     {false,false,false,false,false,false,
-    false,false,false,false,false,false};
+    false,false,false,false,false,false,false};
   // the related filter list has at least one element;
   // may be written only by this module;
 static bool fil_activeo[3]= {false,false,false};
@@ -2412,7 +2426,7 @@ static bool fil_activeo[3]= {false,false,false};
   // index is otype: 0: node; 1: way; 2: relation;
 static bool fil_meetall[fil__pairtM]=
     {false,false,false,false,false,false,
-    false,false,false,false,false,false};
+    false,false,false,false,false,false,false};
   // the tested object must meet all criteria of this filter;
   // for ftype==0..3 ('keep object'):
   // conditions are combined with 'AND';
@@ -2421,6 +2435,8 @@ static bool fil_meetall[fil__pairtM]=
   // be deleted;
   // this element is valid only if there is at least one
   // entry in previous fields;
+
+static int64_t oo__strtosint64(const char* s);   // used before instantiation
 
 static bool fil_filterheader= false;
   // there are filter parameters which affect the header; therefore the
@@ -2464,8 +2480,8 @@ static void fil_parse(int ftype,const char* arg) {
   fee= fil__pairee[ftype];
   if(loglevel>0)
     PINFOv("Filter: %s %s%s:",
-      ftype/3%2==0? "keep": "drop",ONAME(ftype%3),
-      ftype<6? "s": " tags")
+      ftype/3%2==0? "keep": "drop",ONAMEI(ftype==12?3:ftype%3),
+      ftype==12? "" : ftype<6? "s": " tags")
   pk= arg;
   while(*pk==' ') pk++;  // jump over spaces
   if(strzcmp(pk,"all ")==0 || strzcmp(pk,"and ")==0) {
@@ -2493,6 +2509,11 @@ static void fil_parse(int ftype,const char* arg) {
     else if(len==1 && strzcmp(pk,"(")==0) argop= '(';
     else if(len==1 && strzcmp(pk,")")==0) argop= ')';
     if(argop!=0) {  // this is an argument operator
+      if(ftype==12) {  // filter type applies to ID
+        WARNv("only single ID, no operators allowed: %.80s",pk)
+        pk= pe;  // jump to next key/val pair in parameter list
+  continue;
+        }  // filter type applies to IDs
       if(ftype>=6) {  // filter type applies to tags
         if(argop=='(' || argop==')')
           fil__err_tagsbracket++;
@@ -2573,12 +2594,16 @@ static void fil_parse(int ftype,const char* arg) {
       len= pe-pv;  // length of this value
       fil_cpy(fe->v,pv,len,op);  // store this value
       }  // key and value
+    if ( ftype==12 )
+      if ( *(int16_t*)(fe->k)!=0 )
+        fe->id= oo__strtosint64( fe->k[0]>=2? fe->k+1: fe->k+2 );
     if(loglevel>0) {
       static const char* ops[]= { "?",
         "=","!=","=","!=","<",">=",">","<=",
         "?","?","=(numeric)","!=(numeric)",
         "<(numeric)",">=(numeric)",">(numeric)","<=(numeric)" };
 
+      if ( ftype!=12 ) {
       PINFOv("Filter:     %s\"%.80s\"%s %s %s\"%.80s\"%s",
         fe->k[0]<=1 && (fe->k[1] & 1)? "*": "",
         *(int16_t*)(fe->k)==0? "(last key)":
@@ -2589,6 +2614,14 @@ static void fil_parse(int ftype,const char* arg) {
         *(int16_t*)(fe->v)==0? "(anything)":
           fe->v[0]>=2? fe->v+1: fe->v+2,
         fe->v[0]<=1 && (fe->v[1] & 2)? "*": "");
+      } else {
+      PINFOv("Filter:     \"%.80s\" (%ld:%p)",
+        *(int16_t*)(fe->k)==0? "(last key)":
+          fe->k[0]>=2? fe->k+1: fe->k+2,
+          fe->id,
+          fe
+        )
+      }
       }
     if(fe->k[1]=='@')
       fil_filterheader= true;
@@ -2608,7 +2641,7 @@ static void fil_parse(int ftype,const char* arg) {
   fil_active[ftype]= true;
   if(ftype/3==2 || ftype/3==3)  // keep tags OR drop tags
     fil_activeo[ftype%3]= true;
-  if(ftype<6)
+  if(ftype<6 || ftype==12)
     global_recursive= true;  // recursive processing is necessary
   }  // end   fil_parse()
 
@@ -2716,6 +2749,14 @@ static int fil_plausi() {
   return bl+br+bm*100+synt*1000+
     (fil__err_tagsbool+fil__err_tagsbracket)*10000;
   }  // fil_plausi()
+
+static inline bool fil_checki(int otype, int64_t id) {
+  fil__pair_t* fp= fil__pair[12];
+  bool result = false;
+  if ( fp->id )
+    result= fp->id == id;
+  return result;
+  }
 
 static inline bool fil_check0(int otype,
     char** key,char** keye,char** val,char** vale) {
@@ -5715,7 +5756,9 @@ return 18;
       if(!keep && (filterstage!=4 || otype==0 || !global_recursive)) {
           // object not already to keep AND
           // (in stage !=4, or if object is a node)
-        if(!fil_active[otype])
+        if(fil_active[12])
+          keep= fil_checki(otype,id);
+        else if(!fil_active[otype])
           keep= true;
         else  // filter 'keep object' shall be applied
           keep= fil_check0(otype,key,keyf,val,valf);
@@ -6139,6 +6182,7 @@ return 0;
     D(--keep-nodes-ways=,F(0)F(1))
     D(--keep-nodes-relations=,F(0)F(2))
     D(--keep-ways-relations=,F(1)F(2))
+    D(--keep-id=,F(12))
     D(--drop=,F(3)F(4)F(5))
     D(--drop-nodes=,F(3))
     D(--drop-ways=,F(4))
